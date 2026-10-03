@@ -7,7 +7,7 @@ A Pi-native port of [pstack](https://github.com/cursor/plugins/tree/main/pstack)
 Install the published package:
 
 ```bash
-pi install git:github.com/kkgogogo17/pi-pstack@v0.1.0
+pi install git:github.com/kkgogogo17/pi-pstack
 ```
 
 Then restart Pi. Use `pi config` to enable or disable package resources.
