@@ -2,6 +2,8 @@
 
 A Pi-native port of [pstack](https://github.com/cursor/plugins/tree/main/pstack). It includes all 44 upstream skills and their references, playbooks, and scripts, plus Pi implementations of `poteto-agent` and `comment-sicko`.
 
+---
+
 ## Install
 
 Install the published package:
@@ -11,6 +13,8 @@ pi install git:github.com/kkgogogo17/pi-pstack
 ```
 
 Then restart Pi. Use `pi config` to enable or disable package resources.
+
+---
 
 ## Start
 
@@ -24,9 +28,11 @@ Then restart Pi. Use `pi config` to enable or disable package resources.
 
 `/poteto-mode` enables sticky Poteto Mode for the current Pi session and expands the bundled `poteto-mode` skill. `/poteto-mode off` disables it. Individual skills use Pi's standard form, for example `/skill:how` and `/skill:no-comments`.
 
+---
+
 ## Pi subagents
 
-The extension registers a `subagent` tool using Pi's official isolated-process pattern. A child runs as a separate `pi --mode json --print --no-session` process and returns only its final result to the parent context.
+The extension registers a `subagent` tool for isolated child processes. A single `poteto-agent` starts asynchronously through Pi RPC and immediately returns a job ID; other agents retain the foreground `pi --mode json --print --no-session` behavior.
 
 Bundled agents:
 
@@ -41,6 +47,10 @@ It also honors Pi's subagent definition locations:
 - `.pi/agents/*.md` for project agents, only with `agentScope: "project"` or `"both"`.
 
 Bundled agents are the default. Project agents require interactive approval unless `confirmProjectAgents: false` is explicit.
+
+Use `poteto_job` with `action: "status"` to read a result, `action: "steer"` and `message` to guide a running job, `action: "list"` to see jobs, or `action: "stop"` to cancel one. Steering is acknowledged by Pi RPC and takes effect after the child's current tool calls. Running jobs stop when the parent Pi session shuts down; they do not survive a restart. Launch `poteto-agent` singly: parallel `tasks` and sequential `chain` cannot contain one, because those modes wait for their children.
+
+---
 
 ## Safety and compatibility
 
@@ -59,6 +69,8 @@ This port deliberately removes Cursor-only setup and behavior:
 The extension requests confirmation for recognizable shell commands that push, alter pull requests, merge, deploy, mutate infrastructure, or recursively delete files. In non-interactive mode it blocks these commands. This is a guardrail, not a complete shell-security sandbox. Prompts also require explicit approval for all external or irreversible actions.
 
 The upstream `watch-pr` and orchestration helper scripts are retained. Their runtime requirements remain project-specific. In particular, the script package uses Bun and GitHub workflows require `gh` authentication.
+
+---
 
 ## License and provenance
 

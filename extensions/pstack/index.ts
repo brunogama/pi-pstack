@@ -6,11 +6,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai";
-import { getAgentDir, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, RpcClient, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { bundledAgentsDirectory, discoverAgents, projectAgentsDirectory, type AgentConfig, type AgentScope } from "./agents.ts";
 import { ROLE_NAMES, configPath, defaultConfig, modelsForRole, readConfig, writeConfig } from "./config.ts";
 
+import { createPotetoJobs } from "./poteto-jobs.ts";
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
@@ -246,6 +247,16 @@ function knownExternalWrite(command: string): string | undefined {
 export default function (pi: ExtensionAPI) {
   let potetoMode = false;
   let todos: string[] = [];
+  const potetoJobs = createPotetoJobs(
+    (options) => new RpcClient(options),
+    (status) => pi.sendMessage({
+      customType: "pstack-poteto-job",
+      content: `Poteto job ${status.id} ${status.state}. Use poteto_job status for the result.`,
+      display: true,
+    }, { deliverAs: "followUp", triggerTurn: false }),
+  );
+
+  pi.on("session_shutdown", async () => { await potetoJobs.shutdown(); });
 
   pi.on("session_start", (_event, ctx) => {
     potetoMode = false;
@@ -350,7 +361,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ action: StringEnum(["list"] as const) }),
     async execute(_id, _params, _signal, _update, ctx) {
       const sessions = await SessionManager.list(ctx.cwd);
-      const files = sessions.map((session) => session.file);
+      const files = sessions.map((session) => session.path);
       return { content: [{ type: "text", text: files.join("\n") || "No saved sessions for this working directory." }], details: { files } };
     },
   });
@@ -382,9 +393,36 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "poteto_job",
+    label: "Poteto Job",
+    description: "Inspect, steer, or stop a background poteto-agent. A steer reaches the running child through Pi RPC after its current tool calls finish.",
+    parameters: Type.Object({
+      action: StringEnum(["list", "status", "steer", "stop"] as const),
+      id: Type.Optional(Type.String({ description: "Job ID returned by subagent." })),
+      message: Type.Optional(Type.String({ description: "Instruction to steer into a running child." })),
+    }),
+    async execute(_id, params) {
+      const reply = (text: string, details: Record<string, unknown>) => ({ content: [{ type: "text" as const, text }], details });
+      if (params.action === "list") {
+        const jobs = potetoJobs.list().map(({ id, task, state }) => ({ id, task, state }));
+        return reply(JSON.stringify(jobs), { jobs });
+      }
+      if (!params.id) throw new Error(`${params.action} requires a job ID.`);
+      if (params.action === "steer") {
+        if (!params.message) throw new Error("steer requires a message.");
+        const disposition = await potetoJobs.steer(params.id, params.message);
+        return reply(`Steer ${disposition} for ${params.id}.`, { disposition });
+      }
+      const status = params.action === "stop" ? await potetoJobs.stop(params.id) : potetoJobs.status(params.id);
+      const visible = status.state === "completed" ? { ...status, result: truncate(status.result) } : status;
+      return reply(JSON.stringify(visible), { status });
+    },
+  });
+
+  pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: `Delegate isolated work to Pi subagents. Supports exactly one of single agent/task, parallel tasks (maximum ${MAX_PARALLEL_TASKS}), or sequential chain. Bundled pstack agents live in ${bundledAgentsDirectory()}.`,
+    description: `Delegate isolated work to Pi subagents. A single poteto-agent starts asynchronously and returns a job ID; use poteto_job to steer or retrieve its result. Other agents support synchronous single, parallel (maximum ${MAX_PARALLEL_TASKS}), or chain modes. Bundled agents live in ${bundledAgentsDirectory()}.`,
     parameters: SubagentParams,
     async execute(_id, params, signal, onUpdate, ctx) {
       const scope = (params.agentScope ?? "bundled") as AgentScope;
@@ -392,6 +430,9 @@ export default function (pi: ExtensionAPI) {
       const requested = params.agent ? [{ agent: params.agent, task: params.task ?? "", model: params.model, role: params.role, cwd: params.cwd }] : undefined;
       const modes = Number(Boolean(requested && params.task)) + Number(Boolean(params.tasks?.length)) + Number(Boolean(params.chain?.length));
       if (modes !== 1) throw new Error("Provide exactly one mode: agent + task, tasks, or chain.");
+      if ([...(params.tasks ?? []), ...(params.chain ?? [])].some((task) => task.agent === "poteto-agent")) {
+        throw new Error("poteto-agent must be launched as a single asynchronous job; tasks and chain cannot await it.");
+      }
       if ((scope === "project" || scope === "both") && params.confirmProjectAgents !== false && ctx.hasUI) {
         const names = [...(requested ?? []), ...(params.tasks ?? []), ...(params.chain ?? [])].map((task) => task.agent);
         const project = agents.filter((agent) => agent.source === "project" && names.includes(agent.name));
@@ -402,6 +443,27 @@ export default function (pi: ExtensionAPI) {
       }
       const config = await readConfig();
       const childModel = (task: TaskInput, index = 0) => task.model ?? modelsForRole(config, task.role)[index % Math.max(modelsForRole(config, task.role).length, 1)] ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+      if (requested?.[0].agent === "poteto-agent") {
+        const agent = agents.find((candidate) => candidate.name === "poteto-agent");
+        if (!agent) throw new Error("poteto-agent is not available in the selected agent scope.");
+        const task = requested[0];
+        const temp = await temporaryPrompt(agent);
+        const cleanup = () => fsp.rm(temp.directory, { recursive: true, force: true });
+        let status;
+        try {
+          status = await potetoJobs.start({
+            task: task.task,
+            cwd: task.cwd ?? ctx.cwd,
+            promptFile: temp.file,
+            model: childModel(task),
+            cleanup,
+          });
+        } catch (cause) {
+          await cleanup();
+          throw cause;
+        }
+        return { content: [{ type: "text", text: `Poteto agent ${status.state}. Job ID: ${status.id}. Use poteto_job to steer, inspect, or stop it.` }], details: { mode: "background", status } };
+      }
       const makeUpdate = (results: ChildResult[]) => onUpdate?.({
         content: [{ type: "text", text: results.map((result) => `${result.agent}: ${resultText(result)}`).join("\n\n") }],
         details: { results },
