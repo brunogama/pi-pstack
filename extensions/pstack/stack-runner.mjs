@@ -44,6 +44,7 @@ async function run(spec) {
   if (!Array.isArray(tasks) || !tasks.length || tasks.length > 8 || !['single', 'chain', 'parallel'].includes(spec.mode)) throw new Error('Invalid stack specification');
   if (spec.mode === 'single' && tasks.length !== 1) throw new Error('Single mode requires one task');
   const results = [];
+  let failure;
   if (spec.mode === 'parallel') {
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(4, tasks.length) }, async () => {
@@ -57,11 +58,15 @@ async function run(spec) {
     let previous = '';
     for (const [index, task] of tasks.entries()) {
       results[index] = await runChild(spec.cli, { ...task, task: task.task.replaceAll('{previous}', previous) });
-      if (results[index].failed) throw new Error(`${spec.mode === 'chain' ? `Chain step ${index + 1}` : 'Task'} (${task.agent}) failed: ${results[index].error || results[index].text || 'no output'}`);
+      if (results[index].failed) {
+        failure = `${spec.mode === 'chain' ? `Chain step ${index + 1}` : 'Task'} (${task.agent}) failed: ${results[index].error || results[index].text || 'no output'}`;
+        break;
+      }
       previous = results[index].text;
     }
   }
   process.stdout.write(`${JSON.stringify({ mode: spec.mode, results })}\n`);
+  if (failure) throw new Error(failure);
   if (results.some(result => result.failed)) process.exitCode = 1;
 }
 
@@ -69,8 +74,21 @@ const specPath = process.argv[2];
 try {
   if (!specPath || !path.isAbsolute(specPath)) throw new Error('Expected an absolute stack specification path');
   const spec = JSON.parse(await readFile(specPath, 'utf8'));
+  let terminating = false;
+  const terminate = () => {
+    if (terminating) return;
+    terminating = true;
+    process.exitCode = 143;
+    void (async () => {
+      if (spec.cleanupDirectory) await rm(spec.cleanupDirectory, { recursive: true, force: true });
+    })().catch(error => console.error(error)).finally(() => process.exit(143));
+  };
+  process.on('SIGTERM', terminate);
   try { await run(spec); }
-  finally { if (spec.cleanupDirectory) await rm(spec.cleanupDirectory, { recursive: true, force: true }); }
+  finally {
+    if (!terminating) process.off('SIGTERM', terminate);
+    if (spec.cleanupDirectory) await rm(spec.cleanupDirectory, { recursive: true, force: true });
+  }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;

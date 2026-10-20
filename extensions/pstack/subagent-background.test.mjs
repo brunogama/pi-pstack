@@ -5,8 +5,9 @@ import pstack from './index.ts';
 
 function captureSubagent(executeTool) {
   const tools = new Map();
+  const handlers = new Map();
   pstack({
-    on() {},
+    on(name, handler) { handlers.set(name, handler); },
     registerCommand() {},
     registerTool(tool) { tools.set(tool.name, tool); },
     sendMessage() {},
@@ -17,10 +18,22 @@ function captureSubagent(executeTool) {
     model: undefined,
     executeTool,
   };
-  return { tool: tools.get('subagent'), context };
+  return { tool: tools.get('subagent'), context, handlers };
 }
 
 const task = { agent: 'comment-sicko', task: 'Review these comments.' };
+
+test('background shell writes require the same confirmation as foreground shell writes', async () => {
+  const { handlers } = captureSubagent(async () => {});
+  const guard = handlers.get('tool_call');
+  const event = { toolName: 'bash_bg', input: { command: 'git push origin main' } };
+  const denied = await guard(event, { hasUI: false });
+  assert.equal(denied.block, true);
+  let confirmed = false;
+  const permitted = await guard(event, { hasUI: true, ui: { confirm: async () => { confirmed = true; return true; } } });
+  assert.equal(permitted, undefined);
+  assert.equal(confirmed, true);
+});
 
 test('subagent returns a background job ID instead of waiting for a single child', async () => {
   let command;

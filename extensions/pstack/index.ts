@@ -140,7 +140,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName !== "bash") return;
+    if (event.toolName !== "bash" && event.toolName !== "bash_bg") return;
     const input = event.input as { command?: string };
     const operation = input.command ? knownExternalWrite(input.command) : undefined;
     if (!operation) return;
