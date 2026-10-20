@@ -9,7 +9,7 @@ A Pi-native port of [pstack](https://github.com/cursor/plugins/tree/main/pstack)
 Install the published package:
 
 ```bash
-pi install git:github.com/kkgogogo17/pi-pstack
+pi install git:github.com/brunogama/pi-pstack
 ```
 
 Then restart Pi. Use `pi config` to enable or disable package resources.
@@ -32,7 +32,7 @@ Then restart Pi. Use `pi config` to enable or disable package resources.
 
 ## Pi subagents
 
-The extension registers a `subagent` tool for isolated child processes. A single `poteto-agent` starts asynchronously through Pi RPC and immediately returns a job ID; other agents retain the foreground `pi --mode json --print --no-session` behavior.
+The extension registers a `subagent` tool for isolated child processes. A single `poteto-agent` starts asynchronously through Pi RPC and returns a job ID. Other single, parallel, and chain requests launch through the installed `bash_bg` extension, return a background job ID immediately, and send a completion notification. Install and enable a background extension that provides `bash_bg` and `jobs` before using these modes.
 
 Bundled agents:
 
@@ -48,7 +48,12 @@ It also honors Pi's subagent definition locations:
 
 Bundled agents are the default. Project agents require interactive approval unless `confirmProjectAgents: false` is explicit.
 
-Use `poteto_job` with `action: "status"` to read a result, `action: "steer"` and `message` to guide a running job, `action: "list"` to see jobs, or `action: "stop"` to cancel one. Steering is acknowledged by Pi RPC and takes effect after the child's current tool calls. Running jobs stop when the parent Pi session shuts down; they do not survive a restart. Launch `poteto-agent` singly: parallel `tasks` and sequential `chain` cannot contain one, because those modes wait for their children.
+Use `poteto_job` with `action: "status"` to read a result, `action: "steer"` and `message` to guide a running job, `action: "list"` to see jobs, or `action: "stop"` to cancel one. Steering is acknowledged by Pi RPC and takes effect after the child's current tool calls. Running jobs stop when the parent Pi session shuts down; they do not survive a restart. Launch `poteto-agent` singly: parallel `tasks` and sequential `chain` cannot contain one, because its steerable RPC lifecycle differs from ordinary background stacks.
+To wait from a shell, pass the status artifact path from the `subagent` result to `node skills/poteto-mode/scripts/watch-poteto-job.mjs <status-artifact-path> [timeout-ms]`. The watcher waits for the job's terminal artifact state. It exits with code 0 when the job completes. It exits nonzero when the job fails, stops, times out, or the status artifact has invalid JSON.
+
+For other agents, inspect the returned ID using the `jobs` tool with `action: "output"`, wait using `action: "attach"`, or cancel using `action: "kill"`. The job log contains a JSON report with each agent's final answer; a failed child makes the background job fail. The job runner removes its temporary prompts and specification when it exits normally.
+
+Restart Pi after updating an already-loaded extension. Future `subagent` calls then return the changed response.
 
 ---
 

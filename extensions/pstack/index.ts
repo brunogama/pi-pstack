@@ -1,19 +1,16 @@
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { Message } from "@earendil-works/pi-ai";
-import { getAgentDir, RpcClient, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { RpcClient, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { bundledAgentsDirectory, discoverAgents, projectAgentsDirectory, type AgentConfig, type AgentScope } from "./agents.ts";
 import { ROLE_NAMES, configPath, defaultConfig, modelsForRole, readConfig, writeConfig } from "./config.ts";
 
 import { createPotetoJobs } from "./poteto-jobs.ts";
 const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
 const MODE_ENTRY = "pstack-mode";
 
@@ -50,36 +47,11 @@ type TaskInput = {
   cwd?: string;
 };
 
-type Usage = { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number };
-type ChildResult = {
-  agent: string;
-  source: string;
-  task: string;
-  model?: string;
-  exitCode: number;
-  messages: Message[];
-  stderr: string;
-  usage: Usage;
-  stopReason?: string;
-  errorMessage?: string;
-};
 
 function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 }
 
-function resultText(result: ChildResult): string {
-  const final = [...result.messages].reverse().find((message) => message.role === "assistant");
-  if (final?.role === "assistant") {
-    const text = final.content.find((part) => part.type === "text");
-    if (text?.type === "text") return text.text;
-  }
-  return result.errorMessage || result.stderr || "(no output)";
-}
-
-function failure(result: ChildResult): boolean {
-  return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-}
 
 function truncate(text: string): string {
   if (Buffer.byteLength(text) <= MAX_MODEL_OUTPUT_BYTES) return text;
@@ -110,126 +82,6 @@ async function temporaryPrompt(agent: AgentConfig): Promise<{ directory: string;
   return { directory, file };
 }
 
-async function runChild(
-  parentCwd: string,
-  task: TaskInput,
-  agents: AgentConfig[],
-  model: string | undefined,
-  signal: AbortSignal | undefined,
-  onUpdate: ((result: ChildResult) => void) | undefined,
-): Promise<ChildResult> {
-  const agent = agents.find((candidate) => candidate.name === task.agent);
-  if (!agent) {
-    return {
-      agent: task.agent,
-      source: "unknown",
-      task: task.task,
-      exitCode: 1,
-      messages: [],
-      stderr: `Unknown agent ${JSON.stringify(task.agent)}. Available agents: ${agents.map((item) => item.name).join(", ") || "none"}.`,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-    };
-  }
-
-  const result: ChildResult = {
-    agent: agent.name,
-    source: agent.source,
-    task: task.task,
-    model,
-    exitCode: 0,
-    messages: [],
-    stderr: "",
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-  };
-  const temp = await temporaryPrompt(agent);
-  try {
-    const args = ["--mode", "json", "--print", "--no-session", "--append-system-prompt", temp.file];
-    if (model) args.push("--model", model);
-    if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
-    args.push(`Delegated task:\n${task.task}`);
-
-    await new Promise<void>((resolve) => {
-      const invocation = piInvocation(args);
-      const process = spawn(invocation.command, invocation.args, {
-        cwd: task.cwd ?? parentCwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let buffer = "";
-      let aborted = false;
-      const update = () => onUpdate?.(result);
-      const parse = (line: string) => {
-        if (!line.trim()) return;
-        try {
-          const event = JSON.parse(line) as { type?: string; message?: Message };
-          if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-            result.messages.push(event.message);
-            if (event.message.role === "assistant") {
-              result.usage.turns += 1;
-              const usage = event.message.usage;
-              if (usage) {
-                result.usage.input += usage.input ?? 0;
-                result.usage.output += usage.output ?? 0;
-                result.usage.cacheRead += usage.cacheRead ?? 0;
-                result.usage.cacheWrite += usage.cacheWrite ?? 0;
-                result.usage.cost += usage.cost?.total ?? 0;
-              }
-              result.stopReason = event.message.stopReason;
-              result.errorMessage = event.message.errorMessage;
-              if (!result.model && event.message.model) result.model = event.message.model;
-            }
-            update();
-          }
-        } catch {
-          // JSON mode can include diagnostics from third-party extensions. Ignore non-events.
-        }
-      };
-      process.stdout.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        lines.forEach(parse);
-      });
-      process.stderr.on("data", (chunk) => {
-        result.stderr += chunk.toString();
-      });
-      process.on("error", (error) => {
-        result.exitCode = 1;
-        result.stderr += error.message;
-      });
-      process.on("close", (code) => {
-        if (buffer.trim()) parse(buffer);
-        result.exitCode = code ?? 1;
-        if (aborted) result.stopReason = "aborted";
-        resolve();
-      });
-      const kill = () => {
-        aborted = true;
-        process.kill("SIGTERM");
-        setTimeout(() => process.kill("SIGKILL"), 5_000).unref();
-      };
-      if (signal?.aborted) kill();
-      else signal?.addEventListener("abort", kill, { once: true });
-    });
-  } finally {
-    await fsp.rm(temp.directory, { recursive: true, force: true });
-  }
-  return result;
-}
-
-async function runLimited<T>(items: T[], callback: (item: T, index: number) => Promise<ChildResult>): Promise<ChildResult[]> {
-  const results = new Array<ChildResult>(items.length);
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(MAX_CONCURRENCY, items.length) }, async () => {
-      while (next < items.length) {
-        const index = next++;
-        results[index] = await callback(items[index], index);
-      }
-    }),
-  );
-  return results;
-}
 
 function knownExternalWrite(command: string): string | undefined {
   const patterns: Array<[RegExp, string]> = [
@@ -385,7 +237,7 @@ export default function (pi: ExtensionAPI) {
       const config = await readConfig();
       if (params.action === "set") {
         if (!params.role || (!params.model && !params.models?.length)) throw new Error("pstack_config set requires role plus model or models.");
-        config.roles[params.role] = params.models?.length ? params.models : params.model!;
+        config.roles[params.role] = params.models?.length ? params.models : params.model ?? "inherit-parent";
         await writeConfig(config);
       }
       return { content: [{ type: "text", text: JSON.stringify(config, null, 2) }], details: config };
@@ -422,9 +274,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: `Delegate isolated work to Pi subagents. A single poteto-agent starts asynchronously and returns a job ID; use poteto_job to steer or retrieve its result. Other agents support synchronous single, parallel (maximum ${MAX_PARALLEL_TASKS}), or chain modes. Bundled agents live in ${bundledAgentsDirectory()}.`,
+    description: `Delegate isolated work to Pi subagents. A single poteto-agent starts asynchronously and returns a job ID; use poteto_job to steer or retrieve its result. Other agents start background single, parallel (maximum ${MAX_PARALLEL_TASKS}), or chain modes. Bundled agents live in ${bundledAgentsDirectory()}.`,
+    reachesTools: () => ["bash_bg"],
     parameters: SubagentParams,
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       const scope = (params.agentScope ?? "bundled") as AgentScope;
       const agents = discoverAgents(ctx.cwd, scope);
       const requested = params.agent ? [{ agent: params.agent, task: params.task ?? "", model: params.model, role: params.role, cwd: params.cwd }] : undefined;
@@ -462,43 +315,46 @@ export default function (pi: ExtensionAPI) {
           await cleanup();
           throw cause;
         }
-        return { content: [{ type: "text", text: `Poteto agent ${status.state}. Job ID: ${status.id}. Use poteto_job to steer, inspect, or stop it.` }], details: { mode: "background", status } };
+        return {
+          content: [{ type: "text", text: `Poteto agent ${status.state}. Job ID: ${status.id}. Status artifact: ${status.statusArtifactPath}. To wait, run node skills/poteto-mode/scripts/watch-poteto-job.mjs ${status.statusArtifactPath} [timeout-ms]. Use poteto_job to steer, inspect, or stop it.` }],
+          details: { mode: "background", status, statusArtifactPath: status.statusArtifactPath },
+        };
       }
-      const makeUpdate = (results: ChildResult[]) => onUpdate?.({
-        content: [{ type: "text", text: results.map((result) => `${result.agent}: ${resultText(result)}`).join("\n\n") }],
-        details: { results },
-      });
-      const start = (task: TaskInput, index = 0, update?: (result: ChildResult) => void) => runChild(ctx.cwd, task, agents, childModel(task, index), signal, update);
-
-      if (params.chain?.length) {
-        const results: ChildResult[] = [];
-        let previous = "";
-        for (const [index, task] of params.chain.entries()) {
-          const result = await start({ ...task, task: task.task.replaceAll("{previous}", previous) }, index, (current) => makeUpdate([...results, current]));
-          results.push(result);
-          if (failure(result)) throw new Error(`Chain step ${index + 1} (${result.agent}) failed: ${resultText(result)}`);
-          previous = resultText(result);
+      let mode: "single" | "parallel" | "chain" = "single";
+      if (params.chain?.length) mode = "chain";
+      else if (params.tasks?.length) mode = "parallel";
+      const tasks = params.chain ?? params.tasks ?? requested ?? [];
+      if (tasks.length > MAX_PARALLEL_TASKS) throw new Error(`At most ${MAX_PARALLEL_TASKS} tasks are allowed.`);
+      if (signal?.aborted) throw new Error("Subagent launch aborted.");
+      const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "pi-pstack-stack-"));
+      try {
+        const prepared = [];
+        for (const [index, task] of tasks.entries()) {
+          const agent = agents.find((candidate) => candidate.name === task.agent);
+          if (!agent) throw new Error(`Unknown agent ${JSON.stringify(task.agent)}.`);
+          const promptFile = path.join(directory, `agent-${index}.md`);
+          await fsp.writeFile(promptFile, agent.systemPrompt.trim(), { mode: 0o600 });
+          prepared.push({ agent: task.agent, task: task.task, cwd: task.cwd ?? ctx.cwd, model: childModel(task, index), tools: agent.tools, promptFile });
         }
-        return { content: [{ type: "text", text: resultText(results.at(-1)!) }], details: { mode: "chain", results } };
-      }
-
-      if (params.tasks?.length) {
-        if (params.tasks.length > MAX_PARALLEL_TASKS) throw new Error(`At most ${MAX_PARALLEL_TASKS} parallel tasks are allowed.`);
-        const updates: ChildResult[] = params.tasks.map((task) => ({ agent: task.agent, source: "pending", task: task.task, exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }));
-        const results = await runLimited(params.tasks, async (task, index) => {
-          const result = await start(task, index, (current) => { updates[index] = current; makeUpdate(updates); });
-          updates[index] = result;
-          makeUpdate(updates);
-          return result;
+        const specPath = path.join(directory, "stack.json");
+        await fsp.writeFile(specPath, JSON.stringify({ mode, tasks: prepared, cli: piInvocation([]), cleanupDirectory: directory }), { mode: 0o600 });
+        const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+        const runner = fileURLToPath(new URL("./stack-runner.mjs", import.meta.url));
+        const launch = await ctx.executeTool("bash_bg", {
+          command: `${quote(process.execPath)} ${quote(runner)} ${quote(specPath)}`,
+          name: `Pystack ${mode} stack`,
         });
-        const report = results.map((result) => `### ${result.agent} ${failure(result) ? "failed" : "completed"}\n\n${truncate(resultText(result))}`).join("\n\n---\n\n");
-        return { content: [{ type: "text", text: report }], details: { mode: "parallel", results } };
+        const response = launch.result.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
+        const jobId = /\bID: ([a-zA-Z0-9_-]+)/.exec(response)?.[1];
+        if (launch.isError || !jobId) throw new Error(response || "Background extension could not launch the stack.");
+        return {
+          content: [{ type: "text", text: `Subagent ${mode} stack started in the background. Job ID: ${jobId}. Use jobs output to read the result, jobs attach to wait, or jobs kill to stop it.` }],
+          details: { mode, jobId },
+        };
+      } catch (cause) {
+        await fsp.rm(directory, { recursive: true, force: true });
+        throw cause;
       }
-
-      const task = requested![0];
-      const result = await start(task, 0, (current) => makeUpdate([current]));
-      if (failure(result)) throw new Error(`${result.agent} failed: ${resultText(result)}`);
-      return { content: [{ type: "text", text: resultText(result) }], details: { mode: "single", results: [result] } };
     },
   });
 }

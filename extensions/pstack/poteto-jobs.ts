@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 
 type RpcConnection = {
   start(): Promise<void>;
@@ -14,9 +17,57 @@ type JobStatus =
   | { id: string; task: string; state: "running" }
   | { id: string; task: string; state: "completed"; result: string }
   | { id: string; task: string; state: "failed" | "stopped"; error: string };
-type Job = { status: JobStatus; client: RpcConnection; unsubscribe: () => void; cleanup: () => Promise<void>; closing?: Promise<void> };
+type StatusArtifact =
+  | { schemaVersion: 1; jobId: string; state: "running" }
+  | { schemaVersion: 1; jobId: string; state: "completed"; result: string }
+  | { schemaVersion: 1; jobId: string; state: "failed" | "stopped"; error: string };
+type StartedJob = JobStatus & { statusArtifactPath: string };
+type Job = {
+  status: JobStatus;
+  statusArtifactPath: string;
+  client: RpcConnection;
+  unsubscribe: () => void;
+  cleanup: () => Promise<void>;
+  closing?: Promise<void>;
+};
+type StartOptions = {
+  task: string;
+  cwd: string;
+  promptFile: string;
+  model?: string;
+  cliPath?: string;
+  cleanup?: () => Promise<void>;
+  statusDirectory?: string;
+};
 
-type StartOptions = { task: string; cwd: string; promptFile: string; model?: string; cliPath?: string; cleanup?: () => Promise<void> };
+function artifactStatus(status: JobStatus): StatusArtifact {
+  switch (status.state) {
+    case "running": return { schemaVersion: 1, jobId: status.id, state: "running" };
+    case "completed": return { schemaVersion: 1, jobId: status.id, state: "completed", result: status.result };
+    case "failed": return { schemaVersion: 1, jobId: status.id, state: "failed", error: status.error };
+    case "stopped": return { schemaVersion: 1, jobId: status.id, state: "stopped", error: status.error };
+    default: throw new Error("Unexpected poteto job state.");
+  }
+}
+
+async function createStatusArtifact(statusDirectory?: string): Promise<string> {
+  const directory = await fsp.mkdtemp(path.join(statusDirectory ?? os.tmpdir(), "pi-pstack-poteto-"));
+  await fsp.chmod(directory, 0o700);
+  return path.join(directory, "status.json");
+}
+
+async function writeStatusArtifact(artifactPath: string, status: JobStatus): Promise<void> {
+  const temporaryPath = path.join(path.dirname(artifactPath), `.status-${randomUUID()}.json`);
+  const handle = await fsp.open(temporaryPath, "w", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(artifactStatus(status))}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fsp.rename(temporaryPath, artifactPath);
+  await fsp.chmod(artifactPath, 0o600);
+}
 
 export function createPotetoJobs(
   createConnection: (options: ConnectionOptions) => RpcConnection,
@@ -29,18 +80,25 @@ export function createPotetoJobs(
     job.status = status;
     job.unsubscribe();
     job.closing = (async () => {
+      let finalStatus = status;
       try { await job.client.stop(); }
-      catch (cause) { job.status = { id: status.id, task: status.task, state: "failed", error: String(cause) }; }
+      catch (cause) { finalStatus = { id: status.id, task: status.task, state: "failed", error: String(cause) }; }
       try { await job.cleanup(); }
-      catch (cause) { job.status = { id: status.id, task: status.task, state: "failed", error: String(cause) }; }
+      catch (cause) { finalStatus = { id: status.id, task: status.task, state: "failed", error: String(cause) }; }
+      job.status = finalStatus;
+      try { await writeStatusArtifact(job.statusArtifactPath, finalStatus); }
+      catch (cause) {
+        job.status = { id: finalStatus.id, task: finalStatus.task, state: "failed", error: `Could not persist poteto job status: ${String(cause)}` };
+        console.error("Poteto status artifact update failed:", cause);
+      }
+      try { onFinish?.(job.status); }
+      catch (cause) { console.error("Poteto completion notice failed:", cause); }
     })();
-    try { onFinish?.(status); }
-    catch (cause) { console.error("Poteto completion notice failed:", cause); }
     return job.closing;
   };
 
   return {
-    async start(options: StartOptions): Promise<JobStatus> {
+    async start(options: StartOptions): Promise<StartedJob> {
       if ([...jobs.values()].filter((job) => job.status.state === "running").length >= 4) {
         throw new Error("At most four poteto agents can run in the background at once.");
       }
@@ -54,18 +112,27 @@ export function createPotetoJobs(
       });
       const id = `poteto-${randomUUID()}`;
       const cleanup = options.cleanup ?? (async () => {});
+      const statusArtifactPath = await createStatusArtifact(options.statusDirectory);
+      const job: Job = {
+        status: { id, task: options.task, state: "running" },
+        statusArtifactPath,
+        client,
+        unsubscribe: () => {},
+        cleanup,
+      };
+      await writeStatusArtifact(statusArtifactPath, job.status);
       let answer = "";
       let error = "";
-      const job: Job = { status: { id, task: options.task, state: "running" }, client, unsubscribe: () => {}, cleanup };
       job.unsubscribe = client.onEvent((event) => {
         if (typeof event !== "object" || event === null || !("type" in event)) return;
         if (event.type === "message_end" && "message" in event) {
           const message = event.message;
           if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "assistant") return;
           if ("content" in message && Array.isArray(message.content)) {
-            const text = message.content.filter((part): part is { type: "text"; text: string } =>
+            const text = message.content.flatMap((part): string[] =>
               typeof part === "object" && part !== null && part.type === "text" && typeof part.text === "string"
-            ).map((part) => part.text).join("\n");
+                ? [part.text] : []
+            ).join("\n");
             if (text) answer = text;
           }
           if ("stopReason" in message && (message.stopReason === "error" || message.stopReason === "aborted")) {
@@ -73,7 +140,7 @@ export function createPotetoJobs(
           }
         }
         if (event.type === "agent_settled") {
-          finish(job, error
+          void finish(job, error
             ? { id, task: options.task, state: "failed", error }
             : { id, task: options.task, state: "completed", result: answer || "(no output)" });
         }
@@ -82,13 +149,19 @@ export function createPotetoJobs(
       try {
         await client.start();
         const disposition = await client.prompt(`Delegated task:\n${options.task}`);
-        if (disposition === "handled") finish(job, { id, task: options.task, state: "completed", result: answer || "(handled by extension)" });
-        return job.status;
+        if (disposition === "handled") void finish(job, { id, task: options.task, state: "completed", result: answer || "(handled by extension)" });
+        return { ...job.status, statusArtifactPath };
       } catch (cause) {
         jobs.delete(id);
         job.unsubscribe();
+        let error = String(cause);
         try { await client.stop(); }
-        finally { await cleanup(); }
+        catch (stopCause) { error = String(stopCause); }
+        try { await cleanup(); }
+        catch (cleanupCause) { error = String(cleanupCause); }
+        job.status = { id, task: options.task, state: "failed", error };
+        try { await writeStatusArtifact(statusArtifactPath, job.status); }
+        catch (writeCause) { console.error("Poteto status artifact update failed:", writeCause); }
         throw cause;
       }
     },
@@ -105,7 +178,7 @@ export function createPotetoJobs(
       try {
         return await job.client.steer(message);
       } catch (cause) {
-        finish(job, { id, task: job.status.task, state: "failed", error: String(cause) });
+        void finish(job, { id, task: job.status.task, state: "failed", error: String(cause) });
         throw cause;
       }
     },
